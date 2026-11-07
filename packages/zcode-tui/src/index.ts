@@ -7,6 +7,17 @@ import { missingCodingPlanKey } from "../../../src/prompt-preflight.ts";
 import { loadTuiStartupOptions } from "./startup.ts";
 import { preflightSubmission } from "./prompt-preflight.ts";
 import {
+  authFailuresObserved,
+  autoLoginZaiCommand,
+  AutoLoginCoordinator,
+  type AutoLoginEvent,
+  type AutoLoginOutcome,
+  defaultLoginLockPath,
+  isAuthFailureMessage,
+  notifyLoginExpired,
+  observeAuthFailuresOnStderr
+} from "./auto-login.ts";
+import {
   clearSetupPending,
   readConfiguredModelAccess,
   hasConfiguredProviderAccess,
@@ -323,6 +334,7 @@ const exitUsageQueryTimeoutMs = 250;
 const fullscreenWelcomeTransitionMs = 180;
 const terminalFocusIn = "\x1b[I";
 const updateAvailableBlockId = "update_available";
+const autoLoginUrlBlockId = "auto_login_url";
 const modelStatusBlockIdPrefix = "model_status";
 const questionBackValue = "__back__";
 const questionOtherValue = "__other__";
@@ -761,8 +773,12 @@ class ZCodeTui {
   private updateCheckAbortController?: AbortController;
   private loginRequired: boolean;
   private removeStreamErrorGuards?: () => void;
+  private autoLoginCoordinator?: AutoLoginCoordinator;
+  private readonly autoLoginRetriedSubmissions = new WeakSet<object>();
+  private readonly autoLoginRetryAttachments = new WeakMap<object, PromptImageAttachment[]>();
 
   constructor(private readonly options: TuiOptions) {
+    observeAuthFailuresOnStderr();
     this.dynamicWorkflows = new DynamicWorkflows(options);
     this.animateTurnTimer = turnTimerAnimationEnabled();
     this.colorsEnabled = !options.noColor && !process.env.NO_COLOR;
@@ -1440,6 +1456,69 @@ class ZCodeTui {
     this.ui.requestRender(true);
   }
 
+  private onAutoLoginEvent(event: AutoLoginEvent): void {
+    switch (event.type) {
+      case "started":
+        this.addNotice("ZCode login expired — opening your browser to sign in to Z.AI again. Esc cancels.", "warning");
+        break;
+      case "status":
+        this.updateActivity(event.text);
+        break;
+      case "child-output":
+        if (/https?:\/\//u.test(event.line)) this.addNotice(event.line, "muted", autoLoginUrlBlockId);
+        break;
+      case "succeeded":
+        this.addNotice(`${event.summary} Resuming your last message…`, "muted");
+        break;
+      case "failed":
+        this.addNotice(`${event.reason} Run /login to sign in manually, then resubmit.`, "error");
+        break;
+      case "cancelled":
+        this.addNotice("Automatic login cancelled. Run /login to sign in manually, then resubmit.", "muted");
+        break;
+    }
+  }
+
+  /**
+   * Runs one automatic login cycle after an auth-failed turn: banner,
+   * single-flight browser login, bounded wait, then a single replay of the
+   * failed submission. Never re-enters itself: the replay submission is marked
+   * so a second auth failure surfaces as a plain error.
+   */
+  private async runAutoLogin(
+    rawInput: string,
+    submission: ProtectedSubmission,
+    attachments: readonly PromptImageAttachment[]
+  ): Promise<void> {
+    if (this.stopped || this.autoLoginCoordinator) return;
+    const baseCommand = autoLoginZaiCommand();
+    const loginCommand = shouldUseNoBrowserForLogin()
+      ? { ...baseCommand, args: [...baseCommand.args, "--no-browser"] }
+      : baseCommand;
+    const coordinator = new AutoLoginCoordinator({
+      emit: (event) => this.onAutoLoginEvent(event),
+      lockPath: defaultLoginLockPath(),
+      loginCommand,
+      notify: (title, body) => notifyLoginExpired(title, body),
+      readAccess: async () => await readConfiguredModelAccess().then((access) => access !== null, () => false)
+    });
+    const retry: QueuedSubmission = { ...submission, recordHistory: false };
+    this.autoLoginRetriedSubmissions.add(retry);
+    if (attachments.length > 0) this.autoLoginRetryAttachments.set(retry, [...attachments]);
+    this.autoLoginCoordinator = coordinator;
+    let outcome: AutoLoginOutcome;
+    try {
+      outcome = await coordinator.start();
+    } finally {
+      if (this.autoLoginCoordinator === coordinator) this.autoLoginCoordinator = undefined;
+      this.updateActivity(undefined);
+    }
+    if (outcome !== "retry" || this.stopped) return;
+    this.setLoginRequired(false);
+    void this.adoptLoginModel();
+    await this.submit(rawInput, retry);
+  }
+
   private autocompleteCommands(): SlashCommand[] {
     const commands: SlashCommand[] = [];
     for (const command of this.options.slashCommands ?? []) {
@@ -1599,6 +1678,10 @@ class ZCodeTui {
         return { consume: true };
       }
       if (matchesKey(data, "ctrl+c")) {
+        if (this.autoLoginCoordinator?.isActive()) {
+          this.autoLoginCoordinator.cancel("Cancelled from the keyboard.");
+          return { consume: true };
+        }
         if (this.editor.getText()) {
           this.editor.setText("");
           this.ui.requestRender();
@@ -1616,6 +1699,11 @@ class ZCodeTui {
         return { consume: true };
       }
       if (matchesKey(data, "escape")) {
+        if (this.autoLoginCoordinator?.isActive()) {
+          this.clearRewindEscape();
+          this.autoLoginCoordinator.cancel("Cancelled from the keyboard.");
+          return { consume: true };
+        }
         if (this.backgroundTaskEvents.hasActiveHandoffs()) {
           this.clearRewindEscape();
           return { consume: true };
@@ -1657,6 +1745,9 @@ class ZCodeTui {
     const input = (queuedSubmission?.input ?? rawInput).trim();
     if (!input || this.stopped) return false;
     const submission = queuedSubmission ?? protectSubmission(input);
+    // Bracket the turn so a `[project-access-token]` failure printed on stderr
+    // during this submission is attributed to it (the thrown error is generic).
+    const authFailuresAtStart = authFailuresObserved();
     if (!input.startsWith("/") && !this.primaryTurnActive) {
       const allowed = await preflightSubmission({
         validate: () => this.sessionModelIssue
@@ -1894,7 +1985,9 @@ class ZCodeTui {
       return true;
     }
     // Pending images belong to the editor, never to a previously queued draft.
-    const attachments = !queuedSubmission && !steering && !input.startsWith("/") ? [...this.pendingAttachments] : [];
+    const attachments = queuedSubmission
+      ? [...(this.autoLoginRetryAttachments.get(queuedSubmission) ?? [])]
+      : !steering && !input.startsWith("/") ? [...this.pendingAttachments] : [];
     if (steering && !this.options.sendInput) {
       this.inputQueue.queueFollowUp({ ...submission, recordHistory: false });
       return true;
@@ -1929,7 +2022,10 @@ class ZCodeTui {
     if (steering) this.recentSteerCommit = undefined;
     if (!steering) {
       this.backgroundCoordinatorMessageIds.clear();
-      this.addUserMessage(submission.displayInput, attachments.length);
+      // An auto-login retry replays a message already on screen.
+      if (!this.autoLoginRetriedSubmissions.has(submission)) {
+        this.addUserMessage(submission.displayInput, attachments.length);
+      }
     }
     if (submission.pending) {
       this.addNotice([
@@ -2043,10 +2139,18 @@ class ZCodeTui {
           this.pendingTurnNotification = "failed";
           this.pendingTurnNotificationDetail = detail;
         }
-        this.addNotice(
-          steering ? `${detail}\n${steerRecoveryDetail}` : detail,
-          steering ? "warning" : "error"
-        );
+        if (!steering
+          && !this.autoLoginRetriedSubmissions.has(submission)
+          && (isAuthFailureMessage(message) || authFailuresObserved() > authFailuresAtStart)) {
+          // The turn died on expired credentials; the banner and retry come
+          // from the auto-login coordinator instead of a bare error notice.
+          void this.runAutoLogin(rawInput, submission, attachments);
+        } else {
+          this.addNotice(
+            steering ? `${detail}\n${steerRecoveryDetail}` : detail,
+            steering ? "warning" : "error"
+          );
+        }
       }
     } finally {
       if (steering) this.steerAbortControllers.delete(abortController);
@@ -6169,6 +6273,7 @@ class ZCodeTui {
     if (this.stopped) return;
     this.stopped = true;
     this.pendingSteerInterrupt = undefined;
+    this.autoLoginCoordinator?.cancel("TUI exiting.");
     this.turnAbortController?.abort();
     for (const controller of this.steerAbortControllers) controller.abort();
     this.steerAbortControllers.clear();

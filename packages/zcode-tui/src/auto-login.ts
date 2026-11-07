@@ -99,7 +99,7 @@ export function authFailuresObserved(): number {
 }
 
 /** Best-effort desktop notification; missing notify-send (ENOENT) is not an error. */
-export function notifyLoginExpired(title: string, body: string, env: NodeJS.ProcessEnv = process.env): void {
+export function sendDesktopNotification(title: string, body: string, env: NodeJS.ProcessEnv = process.env): void {
   if (env.ZCODE_NO_NOTIFY === "1" || env.ZCODE_NO_NOTIFY?.trim().toLowerCase() === "true") return;
   if (process.platform !== "linux") return;
   try {

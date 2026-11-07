@@ -14,9 +14,24 @@ import {
   type AutoLoginOutcome,
   defaultLoginLockPath,
   isAuthFailureMessage,
-  notifyLoginExpired,
-  observeAuthFailuresOnStderr
+  observeAuthFailuresOnStderr,
+  sendDesktopNotification
 } from "./auto-login.ts";
+import {
+  clearQuotaWaitState,
+  defaultQuotaStatePath,
+  formatResetTime,
+  maxQuotaResumes,
+  notifyQuotaPause,
+  notifyQuotaResume,
+  type QuotaStop,
+  quotaAutoResumeEnabled,
+  QuotaResumeCoordinator,
+  quotaResumeMarginMs,
+  quotaStopFromError,
+  readQuotaWaitState,
+  writeQuotaWaitState
+} from "./quota-resume.ts";
 import {
   clearSetupPending,
   readConfiguredModelAccess,
@@ -335,6 +350,7 @@ const fullscreenWelcomeTransitionMs = 180;
 const terminalFocusIn = "\x1b[I";
 const updateAvailableBlockId = "update_available";
 const autoLoginUrlBlockId = "auto_login_url";
+const quotaBannerBlockId = "quota_wait_banner";
 const modelStatusBlockIdPrefix = "model_status";
 const questionBackValue = "__back__";
 const questionOtherValue = "__other__";
@@ -776,6 +792,8 @@ class ZCodeTui {
   private autoLoginCoordinator?: AutoLoginCoordinator;
   private readonly autoLoginRetriedSubmissions = new WeakSet<object>();
   private readonly autoLoginRetryAttachments = new WeakMap<object, PromptImageAttachment[]>();
+  private quotaWait?: QuotaResumeCoordinator;
+  private readonly quotaResumeCounts = new WeakMap<object, number>();
 
   constructor(private readonly options: TuiOptions) {
     observeAuthFailuresOnStderr();
@@ -935,6 +953,7 @@ class ZCodeTui {
       if (updateCheck?.availableVersion && this.distributionVersion) {
         this.addUpdateAvailable(this.distributionVersion, updateCheck.availableVersion);
       }
+      void this.announcePersistedQuotaWait();
       this.bindInput();
       this.notifications.start();
       this.focusEditor();
@@ -1456,6 +1475,24 @@ class ZCodeTui {
     this.ui.requestRender(true);
   }
 
+  /**
+   * After a restart, surfaces a still-pending shared quota wait as a banner.
+   * The interrupted prompt itself is gone with the old session, so there is
+   * nothing to replay here — the banner just tells the user when the window
+   * reopens.
+   */
+  private async announcePersistedQuotaWait(): Promise<void> {
+    const state = await readQuotaWaitState(defaultQuotaStatePath()).catch(() => undefined);
+    if (!state || this.stopped) return;
+    this.addNotice(
+      `Usage window from a previous session reopens at ${formatResetTime(state.resetAt)}`
+      + `${state.estimate ? " (estimated)" : ""}; resubmit once it resets.`,
+      "muted",
+      quotaBannerBlockId
+    );
+    this.ui.requestRender();
+  }
+
   private onAutoLoginEvent(event: AutoLoginEvent): void {
     switch (event.type) {
       case "started":
@@ -1499,7 +1536,7 @@ class ZCodeTui {
       emit: (event) => this.onAutoLoginEvent(event),
       lockPath: defaultLoginLockPath(),
       loginCommand,
-      notify: (title, body) => notifyLoginExpired(title, body),
+      notify: (title, body) => sendDesktopNotification(title, body),
       readAccess: async () => await readConfiguredModelAccess().then((access) => access !== null, () => false)
     });
     const retry: QueuedSubmission = { ...submission, recordHistory: false };
@@ -1516,6 +1553,70 @@ class ZCodeTui {
     if (outcome !== "retry" || this.stopped) return;
     this.setLoginRequired(false);
     void this.adoptLoginModel();
+    await this.submit(rawInput, retry);
+  }
+
+  /**
+   * Waits out a closed 5-hour usage window after a hard quota stop, then
+   * replays the prompt. The reset time comes from the provider stop when
+   * available (shared via ~/.cache/zcode-app-cli/quota.json so concurrent TUIs
+   * agree and a restart can show it); without one, ZCODE_QUOTA_RESET_HOURS
+   * provides a clearly-labelled estimate, and with neither the raw error is
+   * shown and nothing happens automatically. Replays are capped at
+   * maxQuotaResumes per original prompt.
+   */
+  private async runQuotaResume(
+    rawInput: string,
+    submission: ProtectedSubmission,
+    attachments: readonly PromptImageAttachment[],
+    stop: QuotaStop,
+    previousAttempts: number
+  ): Promise<void> {
+    if (this.stopped || this.quotaWait) return;
+    if (stop.resetAt === undefined) {
+      this.addNotice(
+        `${stop.message}\nNo reset time was reported; set ZCODE_QUOTA_RESET_HOURS to resume on an estimate,`
+        + " or resubmit once the window resets.",
+        "warning"
+      );
+      return;
+    }
+    const statePath = defaultQuotaStatePath();
+    const shared = await readQuotaWaitState(statePath);
+    const resetAt = Math.max(stop.resetAt, shared?.resetAt ?? 0);
+    const estimated = stop.estimated && (shared?.estimate ?? true);
+    await writeQuotaWaitState(statePath, { resetAt, estimate: estimated, updatedAt: Date.now() });
+    this.addNotice(
+      `5-hour usage window reached — waiting until ${formatResetTime(resetAt)}${estimated ? " (estimated)" : ""}.`
+      + " The failed message resumes automatically; Esc cancels.",
+      "warning",
+      quotaBannerBlockId
+    );
+    notifyQuotaPause(resetAt);
+    const coordinator = new QuotaResumeCoordinator({
+      marginMs: quotaResumeMarginMs(),
+      onCountdown: (text) => this.updateActivity(text)
+    });
+    this.quotaWait = coordinator;
+    let outcome: "resume" | "cancelled";
+    try {
+      outcome = await coordinator.waitFor(resetAt, estimated);
+    } finally {
+      if (this.quotaWait === coordinator) this.quotaWait = undefined;
+      this.updateActivity(undefined);
+    }
+    if (outcome !== "resume" || this.stopped) {
+      await clearQuotaWaitState(statePath);
+      this.addNotice("Automatic resume cancelled. Resubmit once the usage window resets.", "muted");
+      return;
+    }
+    await clearQuotaWaitState(statePath);
+    notifyQuotaResume();
+    this.addNotice("Usage window reopened — resuming your last message…", "muted", quotaBannerBlockId);
+    const retry: QueuedSubmission = { ...submission, recordHistory: false };
+    this.autoLoginRetriedSubmissions.add(retry);
+    this.quotaResumeCounts.set(retry, previousAttempts + 1);
+    if (attachments.length > 0) this.autoLoginRetryAttachments.set(retry, [...attachments]);
     await this.submit(rawInput, retry);
   }
 
@@ -1682,6 +1783,10 @@ class ZCodeTui {
           this.autoLoginCoordinator.cancel("Cancelled from the keyboard.");
           return { consume: true };
         }
+        if (this.quotaWait?.isActive()) {
+          this.quotaWait.cancel();
+          return { consume: true };
+        }
         if (this.editor.getText()) {
           this.editor.setText("");
           this.ui.requestRender();
@@ -1702,6 +1807,11 @@ class ZCodeTui {
         if (this.autoLoginCoordinator?.isActive()) {
           this.clearRewindEscape();
           this.autoLoginCoordinator.cancel("Cancelled from the keyboard.");
+          return { consume: true };
+        }
+        if (this.quotaWait?.isActive()) {
+          this.clearRewindEscape();
+          this.quotaWait.cancel();
           return { consume: true };
         }
         if (this.backgroundTaskEvents.hasActiveHandoffs()) {
@@ -2139,7 +2249,12 @@ class ZCodeTui {
           this.pendingTurnNotification = "failed";
           this.pendingTurnNotificationDetail = detail;
         }
-        if (!steering
+        const quotaStop = quotaAutoResumeEnabled() ? quotaStopFromError(error) : undefined;
+        const quotaAttempts = queuedSubmission ? this.quotaResumeCounts.get(queuedSubmission) ?? 0 : 0;
+        if (!steering && quotaStop && quotaAttempts < maxQuotaResumes) {
+          // The 5-hour usage window closed; wait it out and replay the prompt.
+          void this.runQuotaResume(rawInput, submission, attachments, quotaStop, quotaAttempts);
+        } else if (!steering
           && !this.autoLoginRetriedSubmissions.has(submission)
           && (isAuthFailureMessage(message) || authFailuresObserved() > authFailuresAtStart)) {
           // The turn died on expired credentials; the banner and retry come
@@ -2147,8 +2262,10 @@ class ZCodeTui {
           void this.runAutoLogin(rawInput, submission, attachments);
         } else {
           this.addNotice(
-            steering ? `${detail}\n${steerRecoveryDetail}` : detail,
-            steering ? "warning" : "error"
+            quotaStop
+              ? `${detail}\nUsage window retry budget exhausted (${maxQuotaResumes}); resubmit after the window resets.`
+              : steering ? `${detail}\n${steerRecoveryDetail}` : detail,
+            quotaStop ? "warning" : steering ? "warning" : "error"
           );
         }
       }
@@ -6274,6 +6391,7 @@ class ZCodeTui {
     this.stopped = true;
     this.pendingSteerInterrupt = undefined;
     this.autoLoginCoordinator?.cancel("TUI exiting.");
+    this.quotaWait?.cancel();
     this.turnAbortController?.abort();
     for (const controller of this.steerAbortControllers) controller.abort();
     this.steerAbortControllers.clear();
